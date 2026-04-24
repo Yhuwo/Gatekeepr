@@ -87,7 +87,8 @@ def db_connect():
 
 
 def db_init():
-    """Create the settings table if it doesn't exist. Safe to call repeatedly."""
+    """Create the settings table if it doesn't exist. Safe to call repeatedly.
+    Also runs lightweight migrations for columns added in later versions."""
     with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
@@ -99,9 +100,17 @@ def db_init():
                 cooldown_seconds   INTEGER NOT NULL DEFAULT 30,
                 max_attempts       INTEGER NOT NULL DEFAULT 3,
                 modal_timeout      INTEGER NOT NULL DEFAULT 300,
-                patreon_role_ids   TEXT    NOT NULL DEFAULT '[]'
+                patreon_role_ids   TEXT    NOT NULL DEFAULT '[]',
+                admin_logs_enabled INTEGER NOT NULL DEFAULT 1
             )
         """)
+        # Migration: add admin_logs_enabled column if upgrading from an
+        # older schema that didn't have it.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")}
+        if "admin_logs_enabled" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE guild_settings ADD COLUMN admin_logs_enabled INTEGER NOT NULL DEFAULT 1"
+            )
         conn.commit()
 
 
@@ -144,9 +153,24 @@ def update_setting(guild_id: int, key: str, value):
 
 
 def reset_settings(guild_id: int):
-    """Wipe a guild's settings back to defaults."""
+    """Wipe a guild's settings back to defaults.
+
+    The one exception is `admin_logs_enabled`: if an admin has intentionally
+    disabled logging, we don't want a reset to silently re-enable it. We
+    preserve the existing value across the wipe.
+    """
     with db_connect() as conn:
+        row = conn.execute(
+            "SELECT admin_logs_enabled FROM guild_settings WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()
+        preserved_admin_logs = row["admin_logs_enabled"] if row is not None else 1
+
         conn.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
+        conn.execute(
+            "INSERT INTO guild_settings (guild_id, admin_logs_enabled) VALUES (?, ?)",
+            (guild_id, preserved_admin_logs),
+        )
         conn.commit()
 
 
@@ -195,6 +219,27 @@ async def log_event(guild: discord.Guild, message: str, color=discord.Color.blue
         await channel.send(embed=embed)
     except discord.Forbidden:
         pass
+
+
+async def admin_log(interaction: discord.Interaction, action: str, details: str = ""):
+    """Log an admin command use to the guild's log channel, if enabled.
+
+    Called at the top of every admin slash command. Respects the per-guild
+    admin_logs_enabled setting so servers can turn this off.
+
+    Example output:
+        🛠️ **Alice** (`12345`) used `/set-verified-role` → set to @Verified
+    """
+    if interaction.guild is None:
+        return
+    settings = get_settings(interaction.guild.id)
+    if not settings.get("admin_logs_enabled"):
+        return
+
+    msg = f"🛠️ **{interaction.user}** (`{interaction.user.id}`) used `/{action}`"
+    if details:
+        msg += f" — {details}"
+    await log_event(interaction.guild, msg, color=discord.Color.dark_gray())
 
 
 def is_configured(settings: dict):
@@ -523,6 +568,7 @@ async def setup_verify(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"✅ Verify button posted in {verify_channel.mention}.", ephemeral=True
     )
+    await admin_log(interaction, "setup-verify", f"posted button in {verify_channel.mention}")
 
 
 @bot.tree.command(name="grandfather", description="Grant Verified to all existing members (run before locking channels).")
@@ -625,7 +671,9 @@ async def settings_view(interaction: discord.Interaction):
     embed.add_field(name="Max attempts", value=s["max_attempts"] or "Unlimited", inline=True)
     embed.add_field(name="Modal timeout (sec)", value=s["modal_timeout"], inline=True)
     embed.add_field(name="Patreon tier roles", value=patreon_mentions, inline=False)
+    embed.add_field(name="Admin logs", value="Enabled" if s.get("admin_logs_enabled") else "Disabled", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    await admin_log(interaction, "settings", "viewed settings")
 
 
 @bot.tree.command(name="set-verified-role", description="Set the role granted upon successful verification.")
@@ -642,6 +690,7 @@ async def set_verified_role(interaction: discord.Interaction, role: discord.Role
     await interaction.response.send_message(
         f"✅ Verified role set to {role.mention}.", ephemeral=True
     )
+    await admin_log(interaction, "set-verified-role", f"set to {role.mention}")
 
 
 @bot.tree.command(name="set-verify-channel", description="Set the channel where the Verify button lives.")
@@ -651,6 +700,7 @@ async def set_verify_channel(interaction: discord.Interaction, channel: discord.
     await interaction.response.send_message(
         f"✅ Verify channel set to {channel.mention}.", ephemeral=True
     )
+    await admin_log(interaction, "set-verify-channel", f"set to {channel.mention}")
 
 
 @bot.tree.command(name="set-log-channel", description="Set the channel for verification event logs. Omit to disable logging.")
@@ -660,6 +710,8 @@ async def set_log_channel(interaction: discord.Interaction, channel: discord.Tex
     update_setting(interaction.guild.id, "log_channel_id", value)
     msg = f"✅ Log channel set to {channel.mention}." if channel else "✅ Logging disabled."
     await interaction.response.send_message(msg, ephemeral=True)
+    detail = f"set to {channel.mention}" if channel else "logging disabled"
+    await admin_log(interaction, "set-log-channel", detail)
 
 
 @bot.tree.command(name="set-captcha-length", description="How many characters the CAPTCHA has (5-8).")
@@ -670,6 +722,7 @@ async def set_captcha_length(interaction: discord.Interaction, length: app_comma
     await interaction.response.send_message(
         f"✅ CAPTCHA length set to {length}.", ephemeral=True
     )
+    await admin_log(interaction, "set-captcha-length", f"set to {length}")
 
 
 @bot.tree.command(name="set-cooldown", description="Seconds between CAPTCHA requests per user.")
@@ -679,6 +732,7 @@ async def set_cooldown(interaction: discord.Interaction, seconds: app_commands.R
     await interaction.response.send_message(
         f"✅ Cooldown set to {seconds} seconds.", ephemeral=True
     )
+    await admin_log(interaction, "set-cooldown", f"set to {seconds}s")
 
 
 @bot.tree.command(name="set-max-attempts", description="Wrong answers before auto-kick. 0 disables kicking.")
@@ -689,6 +743,7 @@ async def set_max_attempts(interaction: discord.Interaction, attempts: app_comma
     await interaction.response.send_message(
         f"✅ Max attempts set to {label}.", ephemeral=True
     )
+    await admin_log(interaction, "set-max-attempts", f"set to {label}")
 
 
 @bot.tree.command(name="set-modal-timeout", description="Seconds before the 'Enter Answer' button expires.")
@@ -698,6 +753,7 @@ async def set_modal_timeout(interaction: discord.Interaction, seconds: app_comma
     await interaction.response.send_message(
         f"✅ Modal timeout set to {seconds} seconds.", ephemeral=True
     )
+    await admin_log(interaction, "set-modal-timeout", f"set to {seconds}s")
 
 
 @bot.tree.command(name="patreon-add", description="Add a role whose holders skip the CAPTCHA (e.g. a Patreon tier).")
@@ -715,6 +771,7 @@ async def patreon_add(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(
         f"✅ {role.mention} added to Patreon auto-verify list.", ephemeral=True
     )
+    await admin_log(interaction, "patreon-add", f"added {role.mention}")
 
 
 @bot.tree.command(name="patreon-remove", description="Remove a role from the Patreon auto-verify list.")
@@ -732,16 +789,42 @@ async def patreon_remove(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(
         f"✅ {role.mention} removed from Patreon auto-verify list.", ephemeral=True
     )
+    await admin_log(interaction, "patreon-remove", f"removed {role.mention}")
 
 
 @bot.tree.command(name="reset-settings", description="Reset all verification settings to defaults.")
 @app_commands.default_permissions(administrator=True)
 async def reset_settings_command(interaction: discord.Interaction):
+    # Log BEFORE resetting -- after reset, the log channel ID is gone and
+    # we couldn't post the "reset happened" message anywhere.
+    await admin_log(interaction, "reset-settings", "all settings wiped to defaults")
     reset_settings(interaction.guild.id)
     await interaction.response.send_message(
-        "✅ Settings reset to defaults. Reconfigure with the `/set-*` commands.",
+        "✅ Settings reset to defaults. Reconfigure with the `/set-*` commands.\n"
+        "*(Your admin logs toggle was preserved.)*",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="set-admin-logs", description="Enable or disable logging of admin command use.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(enabled="True to log every admin command, False to disable.")
+async def set_admin_logs(interaction: discord.Interaction, enabled: bool):
+    """Toggles the per-guild admin_logs_enabled flag.
+
+    When enabled (default), every admin slash command posts a log entry to
+    the configured log channel showing who used which command. Turn off if
+    you find the logs noisy or if your admins want privacy from each other.
+    """
+    update_setting(interaction.guild.id, "admin_logs_enabled", 1 if enabled else 0)
+    status = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(
+        f"✅ Admin command logging is now **{status}**.", ephemeral=True
+    )
+    # Log the toggle itself. If we just turned it ON, this will post.
+    # If we turned it OFF, admin_log will silently skip -- which is the
+    # expected behavior (no more admin logs from this point).
+    await admin_log(interaction, "set-admin-logs", f"turned {status}")
 
 
 # =============================================================================
@@ -816,6 +899,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/set-log-channel [channel]` — Where verification events are "
             "logged. Omit the channel to disable logging.\n"
+            "`/set-admin-logs <true|false>` — Whether admin command use is "
+            "logged to the log channel. Default on.\n"
             "`/set-captcha-length <5-8>` — How many characters the CAPTCHA "
             "image has. Default `6`.\n"
             "`/set-cooldown <seconds>` — Wait time between CAPTCHA requests "
