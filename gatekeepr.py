@@ -71,6 +71,16 @@ TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DB_DIR = Path(__file__).parent / "guilds"
 DB_DIR.mkdir(exist_ok=True)
 
+# Where to write the public status JSON consumed by the website.
+# The file is updated periodically with bot uptime, server count, and
+# aggregate verification numbers. If the directory doesn't exist or isn't
+# writable (e.g. running locally), the writer logs and skips silently.
+STATUS_FILE = Path(os.environ.get("GATEKEEPR_STATUS_FILE", "/var/www/gatekeepr/status.json"))
+STATUS_WRITE_INTERVAL_SECONDS = 60
+
+# Bot startup time, set on import. Used for uptime calculation.
+BOT_STARTED_AT = time.time()
+
 # The CAPTCHA character set. Excludes confusing chars like 0/O/1/I/L.
 # Applies globally; can't be customized per-server (keeps things simple).
 CAPTCHA_CHARSET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -94,11 +104,22 @@ def db_path(guild_id: int) -> Path:
 def db_connect(guild_id: int):
     """Open a connection to a specific guild's DB.
     Ensures the schema exists. Safe to call repeatedly — CREATE IF NOT EXISTS
-    on every connection is cheap."""
+    on every connection is cheap.
+
+    WAL mode is enabled so the dashboard process can read/write the same
+    database files concurrently with the bot. WAL is a per-database setting
+    that persists across connections, so setting it every time is idempotent.
+
+    busy_timeout makes SQLite wait up to 5 seconds for a lock instead of
+    immediately raising 'database is locked' — important when the dashboard
+    saves while the bot is mid-transaction.
+    """
     path = db_path(guild_id)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     _ensure_schema(conn)
     return conn
 
@@ -183,6 +204,60 @@ def _ensure_schema(conn):
             original_inviter_name TEXT
         )
     """)
+
+    # --- Verifications: every successful verification, with method ------
+    # Used by /stats for activity reporting. Method values:
+    #   'captcha'      -- user solved a CAPTCHA
+    #   'patreon'      -- auto-verified via Patreon tier role
+    #   'grandfather'  -- bulk-verified via /grandfather
+    # solve_seconds is only meaningful for 'captcha' (else NULL).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS verifications (
+            user_id        INTEGER NOT NULL,
+            username       TEXT    NOT NULL,
+            verified_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            method         TEXT    NOT NULL,
+            solve_seconds  INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_verif_at ON verifications(verified_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_verif_method ON verifications(method)")
+
+    # --- Kicks: tracks bot-initiated kicks (CAPTCHA failures, autodisable) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kicks (
+            user_id     INTEGER NOT NULL,
+            username    TEXT    NOT NULL,
+            kicked_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            reason      TEXT    NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kicks_at ON kicks(kicked_at)")
+
+    # --- Lockdown history: which channels has GateKeepr currently locked? -
+    # Source of truth for /lockdown-undo. We INSERT a row per channel at
+    # /lockdown time, DELETE it at /lockdown-undo time. Channel ID is the
+    # primary key so re-running /lockdown is idempotent (no duplicates).
+    # modified_role_ids is a JSON list of role IDs we set channel
+    # overwrites for, so /lockdown-undo can remove the EXACT overwrites
+    # we added (not just @everyone). is_verify_channel flips the meaning
+    # of those overwrites (we set role denies on the verify channel
+    # instead of allows).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lockdown_history (
+            channel_id        INTEGER PRIMARY KEY,
+            locked_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+            locked_by_user_id INTEGER,
+            modified_role_ids TEXT    NOT NULL DEFAULT '[]',
+            is_verify_channel INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    # Migration for older DBs where these columns didn't exist
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(lockdown_history)")}
+    if "modified_role_ids" not in existing_cols:
+        conn.execute("ALTER TABLE lockdown_history ADD COLUMN modified_role_ids TEXT NOT NULL DEFAULT '[]'")
+    if "is_verify_channel" not in existing_cols:
+        conn.execute("ALTER TABLE lockdown_history ADD COLUMN is_verify_channel INTEGER NOT NULL DEFAULT 0")
 
     conn.commit()
 
@@ -333,6 +408,179 @@ def record_ban(
              original_inviter_id, original_inviter_name),
         )
         conn.commit()
+
+
+def record_verification(
+    guild_id: int,
+    user_id: int,
+    username: str,
+    method: str,
+    solve_seconds: int | None = None,
+):
+    """Log a successful verification. Used by /stats.
+
+    method: 'captcha' | 'patreon' | 'grandfather'
+    solve_seconds: how long the user took to solve the CAPTCHA (only for 'captcha')
+    """
+    with db_connect(guild_id) as conn:
+        conn.execute(
+            "INSERT INTO verifications (user_id, username, method, solve_seconds) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, username, method, solve_seconds),
+        )
+        conn.commit()
+
+
+def record_kick(guild_id: int, user_id: int, username: str, reason: str):
+    """Log a bot-initiated kick (failed CAPTCHA, joined via disabled invite, etc)."""
+    with db_connect(guild_id) as conn:
+        conn.execute(
+            "INSERT INTO kicks (user_id, username, reason) VALUES (?, ?, ?)",
+            (user_id, username, reason),
+        )
+        conn.commit()
+
+
+def record_lockdown(guild_id: int, channel_id: int, *,
+                    locked_by_user_id: int,
+                    modified_role_ids: list[int],
+                    is_verify_channel: bool):
+    """Mark a single channel as locked by GateKeepr. Idempotent — re-locking
+    the same channel updates the timestamp and overwrites the role list,
+    rather than duplicating. Used by /lockdown-undo as the source of truth
+    for which overwrites to remove."""
+    with db_connect(guild_id) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO lockdown_history "
+            "(channel_id, locked_by_user_id, locked_at, "
+            " modified_role_ids, is_verify_channel) "
+            "VALUES (?, ?, datetime('now'), ?, ?)",
+            (
+                channel_id,
+                locked_by_user_id,
+                json.dumps([int(r) for r in modified_role_ids]),
+                1 if is_verify_channel else 0,
+            ),
+        )
+        conn.commit()
+
+
+def get_locked_channel_ids(guild_id: int) -> list[int]:
+    """Channels GateKeepr has locked in this guild. Used by /lockdown-undo."""
+    with db_connect(guild_id) as conn:
+        rows = conn.execute(
+            "SELECT channel_id FROM lockdown_history"
+        ).fetchall()
+    return [r["channel_id"] for r in rows]
+
+
+def get_lockdown_records(guild_id: int) -> list[dict]:
+    """Full lockdown records — channel_id plus the role overwrites we set
+    and whether it was the verify channel. Used by /lockdown-undo to remove
+    every overwrite we added, not just the @everyone one."""
+    with db_connect(guild_id) as conn:
+        rows = conn.execute(
+            "SELECT channel_id, modified_role_ids, is_verify_channel "
+            "FROM lockdown_history"
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            role_ids = json.loads(r["modified_role_ids"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            role_ids = []
+        out.append({
+            "channel_id": r["channel_id"],
+            "modified_role_ids": [int(x) for x in role_ids if x is not None],
+            "is_verify_channel": bool(r["is_verify_channel"]),
+        })
+    return out
+
+
+def clear_lockdown_history(guild_id: int, channel_ids: list[int] | None = None):
+    """Drop rows from lockdown_history. If channel_ids is None, clears the
+    whole table. Otherwise only clears the listed channels."""
+    with db_connect(guild_id) as conn:
+        if channel_ids is None:
+            conn.execute("DELETE FROM lockdown_history")
+        elif channel_ids:
+            placeholders = ",".join("?" * len(channel_ids))
+            conn.execute(
+                f"DELETE FROM lockdown_history WHERE channel_id IN ({placeholders})",
+                channel_ids,
+            )
+        conn.commit()
+
+
+def compute_stats(guild_id: int) -> dict:
+    """Build the full stats dict for /stats. One DB connection, one trip.
+
+    Returns counts for: lifetime, last 30 days, last 7 days, last 24 hours.
+    Plus: method breakdown, average CAPTCHA solve time, currently disabled invites.
+    """
+    with db_connect(guild_id) as conn:
+        def count_since(table, hours):
+            row = conn.execute(
+                f"SELECT COUNT(*) AS c FROM {table} "
+                f"WHERE {('verified_at' if table == 'verifications' else 'kicked_at' if table == 'kicks' else 'joined_at' if table == 'joins' else 'banned_at')} "
+                f">= datetime('now', ?)",
+                (f"-{hours} hours",),
+            ).fetchone()
+            return row["c"]
+
+        def total(table):
+            return conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+
+        # Method breakdown
+        methods = {
+            row["method"]: row["c"]
+            for row in conn.execute(
+                "SELECT method, COUNT(*) AS c FROM verifications GROUP BY method"
+            )
+        }
+
+        # Average CAPTCHA solve time (in seconds), only over rows where it was recorded
+        avg_solve_row = conn.execute(
+            "SELECT AVG(solve_seconds) AS avg_s FROM verifications "
+            "WHERE method = 'captcha' AND solve_seconds IS NOT NULL"
+        ).fetchone()
+        avg_solve = avg_solve_row["avg_s"]
+
+        # Disabled invites currently in effect
+        disabled_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM disabled_invites"
+        ).fetchone()["c"]
+
+    return {
+        "verifications": {
+            "lifetime": total("verifications"),
+            "last_30d": count_since("verifications", 24 * 30),
+            "last_7d": count_since("verifications", 24 * 7),
+            "last_24h": count_since("verifications", 24),
+        },
+        "joins": {
+            "lifetime": total("joins"),
+            "last_30d": count_since("joins", 24 * 30),
+            "last_7d": count_since("joins", 24 * 7),
+        },
+        "kicks": {
+            "lifetime": total("kicks"),
+            "last_30d": count_since("kicks", 24 * 30),
+            "last_7d": count_since("kicks", 24 * 7),
+        },
+        "bans": {
+            "lifetime": total("bans"),
+            "last_30d": count_since("bans", 24 * 30),
+            "last_7d": count_since("bans", 24 * 7),
+        },
+        "method_breakdown": {
+            "captcha": methods.get("captcha", 0),
+            "patreon": methods.get("patreon", 0),
+            "grandfather": methods.get("grandfather", 0),
+        },
+        "avg_solve_seconds": avg_solve,
+        "disabled_invites": disabled_count,
+    }
 
 
 def ban_count_for_invite(guild_id: int, invite_code: str) -> int:
@@ -496,6 +744,8 @@ last_attempt_time = {}   # (guild_id, user_id) -> unix timestamp
 failed_attempts = {}     # (guild_id, user_id) -> consecutive failed count
 captcha_interactions = {}  # (guild_id, user_id) -> the discord.Interaction that sent the CAPTCHA
                           # (needed so we can delete the CAPTCHA image after the user fails)
+captcha_started_at = {}  # (guild_id, user_id) -> unix timestamp the CAPTCHA was issued
+                         # (used to compute solve time for /stats)
 
 
 # =============================================================================
@@ -621,6 +871,10 @@ class AnswerModal(discord.ui.Modal, title="Enter CAPTCHA"):
 
         # Correct answer
         if self.answer.value.strip().upper() == correct:
+            # Compute solve time before we clear state
+            started = captcha_started_at.pop(key, None)
+            solve_seconds = int(time.time() - started) if started else None
+
             pending_captchas.pop(key, None)
             failed_attempts.pop(key, None)
             await delete_captcha_message()
@@ -641,6 +895,11 @@ class AnswerModal(discord.ui.Modal, title="Enter CAPTCHA"):
                     ephemeral=True,
                 )
                 return
+
+            # Record for /stats
+            record_verification(
+                guild.id, user.id, str(user), "captcha", solve_seconds
+            )
 
             await interaction.response.send_message(
                 "✅ Verified! Welcome to the server.", ephemeral=True
@@ -673,9 +932,11 @@ class AnswerModal(discord.ui.Modal, title="Enter CAPTCHA"):
             )
             try:
                 await user.kick(reason=f"Failed CAPTCHA {attempts} times")
+                record_kick(guild.id, user.id, str(user), f"Failed CAPTCHA {attempts} times")
             except discord.Forbidden:
                 pass
             failed_attempts.pop(key, None)
+            captcha_started_at.pop(key, None)
             return
 
         remaining = "" if not max_attempts else f" ({max_attempts - attempts} attempt(s) left)"
@@ -759,6 +1020,7 @@ class VerifyView(discord.ui.View):
 
         text, buffer = generate_captcha(settings["captcha_length"])
         pending_captchas[key] = text
+        captcha_started_at[key] = time.time()
         file = discord.File(buffer, filename="captcha.png")
 
         await interaction.response.send_message(
@@ -816,6 +1078,9 @@ async def on_ready():
     # Start the daily retention sweep
     if not retention_sweep.is_running():
         retention_sweep.start()
+    # Start the public status JSON writer
+    if not status_writer.is_running():
+        status_writer.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id}) — serving {len(bot.guilds)} guilds")
 
 
@@ -914,6 +1179,8 @@ async def on_member_join(member: discord.Member):
         if row:
             try:
                 await member.kick(reason="Joined via auto-disabled invite")
+                record_kick(guild.id, member.id, str(member),
+                            f"Joined via auto-disabled invite {used_code}")
                 await log_event(
                     guild,
                     f"🚫 Kicked **{member}** — joined via auto-disabled invite `{used_code}`.",
@@ -1082,6 +1349,71 @@ async def retention_sweep():
             print(f"Retention sweep failed for guild {guild.id}: {e}")
 
 
+def compute_global_stats() -> dict:
+    """Aggregate verification counts across every guild the bot serves.
+
+    Walks every guild SQLite file. For 1-100 guilds this is cheap (a few ms
+    total). For thousands we'd want caching, but we'll cross that bridge if
+    we get there.
+    """
+    total_verifications = 0
+    verifications_24h = 0
+    total_servers = len(bot.guilds)
+
+    for guild in bot.guilds:
+        try:
+            with db_connect(guild.id) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM verifications"
+                ).fetchone()
+                total_verifications += row["c"]
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM verifications "
+                    "WHERE verified_at >= datetime('now', '-24 hours')"
+                ).fetchone()
+                verifications_24h += row["c"]
+        except Exception as e:
+            # A single guild's DB failing shouldn't break the whole stats
+            # endpoint -- just log and skip.
+            print(f"[global_stats] guild {guild.id} skipped: {e}", flush=True)
+
+    return {
+        "total_servers": total_servers,
+        "total_verifications": total_verifications,
+        "verifications_24h": verifications_24h,
+    }
+
+
+@tasks.loop(seconds=STATUS_WRITE_INTERVAL_SECONDS)
+async def status_writer():
+    """Periodically write status.json so the website can show live data.
+
+    Writes atomically: dump to a .tmp file, then rename. This way the
+    website never reads a half-written file.
+    """
+    try:
+        global_stats = compute_global_stats()
+        payload = {
+            "online": True,
+            "version": "1.5",  # bump this when you ship breaking changes
+            "uptime_seconds": int(time.time() - BOT_STARTED_AT),
+            "last_updated": datetime.utcnow().isoformat() + "Z",
+            **global_stats,
+        }
+
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATUS_FILE.with_suffix(STATUS_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(STATUS_FILE)
+    except PermissionError as e:
+        # Probably running as a non-root user without write access to /var/www.
+        # Log once, then keep trying every interval -- maybe someone fixes it.
+        print(f"[status_writer] permission denied writing {STATUS_FILE}: {e}",
+              flush=True)
+    except Exception as e:
+        print(f"[status_writer] failed: {e}", flush=True)
+
+
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     """Detect Patreon role assignments and auto-verify."""
@@ -1107,6 +1439,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     try:
         await after.add_roles(verified_role, reason="Auto-verified via Patreon tier")
+        record_verification(after.guild.id, after.id, str(after), "patreon")
         await log_event(
             after.guild,
             f"💜 **{after}** (`{after.id}`) auto-verified via Patreon role.",
@@ -1214,6 +1547,7 @@ async def grandfather(interaction: discord.Interaction):
         else:
             try:
                 await member.add_roles(role, reason="Grandfathered before CAPTCHA rollout")
+                record_verification(guild.id, member.id, str(member), "grandfather")
                 granted += 1
             except (discord.Forbidden, discord.HTTPException):
                 failed += 1
@@ -1293,6 +1627,108 @@ async def settings_view(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
     await admin_log(interaction, "settings", "viewed settings")
+
+
+@bot.tree.command(name="stats", description="Show verification activity stats for this server.")
+@app_commands.default_permissions(administrator=True)
+async def stats(interaction: discord.Interaction):
+    s = compute_stats(interaction.guild.id)
+    v = s["verifications"]
+    j = s["joins"]
+    k = s["kicks"]
+    b = s["bans"]
+    m = s["method_breakdown"]
+
+    # Verification rate: of people who joined in last 30d, how many got verified?
+    rate = ""
+    if j["last_30d"] > 0:
+        pct = (v["last_30d"] / j["last_30d"]) * 100
+        rate = f" ({pct:.0f}% of joiners)"
+
+    # Average solve time
+    if s["avg_solve_seconds"] is not None:
+        avg = s["avg_solve_seconds"]
+        if avg < 60:
+            solve_str = f"{avg:.1f} seconds"
+        else:
+            solve_str = f"{avg / 60:.1f} minutes"
+    else:
+        solve_str = "*(no CAPTCHA solves yet)*"
+
+    embed = discord.Embed(
+        title="📊 GateKeepr Stats",
+        description=f"Activity for **{interaction.guild.name}**",
+        color=discord.Color.purple(),
+    )
+
+    embed.add_field(
+        name="✅ Verifications",
+        value=(
+            f"**Last 24h:** {v['last_24h']}\n"
+            f"**Last 7d:** {v['last_7d']}\n"
+            f"**Last 30d:** {v['last_30d']}{rate}\n"
+            f"**Lifetime:** {v['lifetime']}"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🚪 Joins",
+        value=(
+            f"**Last 7d:** {j['last_7d']}\n"
+            f"**Last 30d:** {j['last_30d']}\n"
+            f"**Lifetime:** {j['lifetime']}"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="\u200b",  # Empty field for layout
+        value="\u200b",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🥷 By method",
+        value=(
+            f"**CAPTCHA:** {m['captcha']}\n"
+            f"**Patreon auto:** {m['patreon']}\n"
+            f"**Grandfathered:** {m['grandfather']}"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="❌ Removals",
+        value=(
+            f"**Kicks (30d):** {k['last_30d']}\n"
+            f"**Kicks (lifetime):** {k['lifetime']}\n"
+            f"**Bans (lifetime):** {b['lifetime']}"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="\u200b",
+        value="\u200b",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="⏱️ Avg CAPTCHA solve",
+        value=solve_str,
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🚫 Disabled invites",
+        value=str(s["disabled_invites"]),
+        inline=True,
+    )
+
+    embed.set_footer(text="Stats are tracked from the moment this version of the bot is deployed.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await admin_log(interaction, "stats", "viewed stats")
 
 
 @bot.tree.command(name="set-verified-role", description="Set the role granted upon successful verification.")
@@ -1451,6 +1887,770 @@ async def patreon_remove(interaction: discord.Interaction, role: discord.Role):
     await admin_log(interaction, "patreon-remove", f"removed {role.mention}")
 
 
+# =============================================================================
+# /lockdown and /lockdown-undo — auto-configure channel permissions so that
+# unverified members can only see the verify channel.
+# =============================================================================
+#
+# Logic:
+# - For every channel that's currently public (i.e. @everyone has no `view`
+#   deny overwrite), we deny @everyone's view permission and explicitly
+#   allow the Verified role and any configured Patreon roles. Other roles'
+#   existing channel overwrites are left untouched. Channels that are
+#   ALREADY private to @everyone (mod-only, etc.) are skipped — we don't
+#   want to grant Verified members access to mod channels.
+# - The verify channel itself gets the inverse: @everyone allowed to view,
+#   Verified + Patreon roles denied (so they don't see it cluttering their
+#   list once they've got past it).
+# - We never touch role.permissions at the server level. Everything is
+#   per-channel overwrites, which means Administrators (who bypass
+#   overwrites) keep working unchanged.
+#
+# The flow uses a confirmation View so admins always see a preview first.
+
+LOCKDOWN_CONFIRM_TIMEOUT_SECONDS = 60
+
+
+def _compute_lockdown_plan(guild: discord.Guild, settings: dict) -> dict:
+    """Inspect every channel and split into 'will lock', 'will skip', and
+    'can't touch'. Returns a dict the preview embed and the apply step
+    both consume.
+
+    A channel goes into `unmanageable` when the bot's effective permissions
+    on it lack Manage Roles — usually because a category overwrite blocks
+    the bot's role even though it has Manage Roles server-wide. We flag
+    these in the preview (grouped by category, since fixing the category
+    fixes all its children at once) and skip them in the apply step
+    instead of hitting Forbidden mid-run.
+    """
+    verified_role_id = settings.get("verified_role_id")
+    verify_channel_id = settings.get("verify_channel_id")
+    patreon_role_ids = settings.get("patreon_role_ids", []) or []
+    me = guild.me
+
+    to_lock: list[discord.abc.GuildChannel] = []
+    to_skip_already_private: list[discord.abc.GuildChannel] = []
+    unmanageable: list[discord.abc.GuildChannel] = []
+
+    for ch in guild.channels:
+        # Categories aren't directly modified — channel-level overwrites
+        # are what determine actual user visibility.
+        if isinstance(ch, discord.CategoryChannel):
+            continue
+        # The verify channel is handled separately (different rules).
+        if ch.id == verify_channel_id:
+            continue
+        # Pre-flight FIRST: does the bot have View Channel + Manage
+        # Channels + Manage Permissions here? (The API calls the last one
+        # `manage_roles` but Discord's UI labels it "Manage Permissions"
+        # — same permission.) View Channel is foundational; without it,
+        # Discord treats other perms as dead. We check this BEFORE the
+        # "already private" classification below, so channels with
+        # leftover @everyone-deny from a previously-failed lockdown still
+        # surface in the "Can't manage" section instead of being silently
+        # filed under "skipping already-private channels".
+        eff = ch.permissions_for(me)
+        if not (eff.view_channel and eff.manage_channels and eff.manage_roles):
+            unmanageable.append(ch)
+            continue
+        # Treat already-private channels (e.g. mod-only) as off-limits to
+        # avoid accidentally granting Verified/Patreon access there.
+        ow = ch.overwrites_for(guild.default_role)
+        if ow.view_channel is False:
+            to_skip_already_private.append(ch)
+            continue
+        to_lock.append(ch)
+
+    # Check the verify channel separately. If we can't manage it AND it's
+    # not already public to @everyone, lockdown will leave members locked
+    # out of verification — surface this loudly in the preview.
+    verify_channel = guild.get_channel(verify_channel_id) if verify_channel_id else None
+    verify_unmanageable = False
+    if verify_channel is not None:
+        veff = verify_channel.permissions_for(me)
+        verify_unmanageable = not (
+            veff.view_channel and veff.manage_channels and veff.manage_roles
+        )
+
+    return {
+        "to_lock": to_lock,
+        "to_skip": to_skip_already_private,
+        "unmanageable": unmanageable,
+        "verify_channel": verify_channel,
+        "verify_unmanageable": verify_unmanageable,
+        "verified_role_id": verified_role_id,
+        "patreon_role_ids": list(patreon_role_ids),
+    }
+
+
+def _group_channels_by_category(channels: list) -> dict[str, list[str]]:
+    """Group channel name strings by their parent category name.
+    Channels without a category land in 'Uncategorized'. Used by the
+    lockdown preview to give the admin a category-level fix-list."""
+    groups: dict[str, list[str]] = {}
+    for ch in channels:
+        cat_name = ch.category.name if ch.category else "Uncategorized"
+        groups.setdefault(cat_name, []).append(f"#{ch.name}")
+    return groups
+
+
+def _build_lockdown_preview(guild: discord.Guild, plan: dict) -> discord.Embed:
+    """Embed shown to the admin before they confirm."""
+    verify_channel = plan["verify_channel"]
+    embed = discord.Embed(
+        title="🔒 Lockdown preview",
+        description=(
+            f"This will modify **{len(plan['to_lock'])}** channel"
+            f"{'' if len(plan['to_lock']) == 1 else 's'} so unverified members can "
+            f"only see {verify_channel.mention if verify_channel else '#verify'}."
+        ),
+        color=discord.Color.orange(),
+    )
+
+    verified_role = guild.get_role(plan["verified_role_id"])
+    patreon_roles = [
+        guild.get_role(rid) for rid in plan["patreon_role_ids"]
+    ]
+    patreon_roles = [r for r in patreon_roles if r is not None]
+
+    keep_lines = []
+    if verified_role:
+        keep_lines.append(f"**Verified role:** {verified_role.mention}")
+    if patreon_roles:
+        keep_lines.append(
+            "**Patreon roles:** " + ", ".join(r.mention for r in patreon_roles)
+        )
+    else:
+        keep_lines.append("**Patreon roles:** _(none configured)_")
+    keep_lines.append("**Other role overwrites:** left untouched")
+    keep_lines.append("**Administrators:** unaffected (bypass overwrites)")
+
+    embed.add_field(
+        name="✅ Will keep access",
+        value="\n".join(keep_lines),
+        inline=False,
+    )
+
+    if plan["to_skip"]:
+        names = ", ".join(f"#{c.name}" for c in plan["to_skip"][:10])
+        if len(plan["to_skip"]) > 10:
+            names += f" _(+{len(plan['to_skip']) - 10} more)_"
+        embed.add_field(
+            name=f"⏭️ Skipping {len(plan['to_skip'])} already-private channel"
+                 f"{'' if len(plan['to_skip']) == 1 else 's'}",
+            value=names[:1024],
+            inline=False,
+        )
+
+    # Surface channels we can't touch BEFORE the user confirms — saves
+    # them a round trip of "modified 0, couldn't modify 4". Group by
+    # category since the actual fix is almost always at the category
+    # level (one overwrite there cascades to all its channels).
+    unman = plan.get("unmanageable", [])
+    verify_unman = plan.get("verify_unmanageable", False)
+    if unman or verify_unman:
+        parts: list[str] = []
+
+        if verify_unman and plan["verify_channel"] is not None:
+            parts.append(
+                f"**{plan['verify_channel'].mention}** _(the verify channel — "
+                f"if it's not already public to `@everyone`, verification will break)_"
+            )
+            parts.append("")
+
+        if unman:
+            groups = _group_channels_by_category(unman)
+            for cat_name, ch_names in groups.items():
+                # Truncate per-category if it's huge so we fit in the field
+                shown = ", ".join(ch_names[:8])
+                if len(ch_names) > 8:
+                    shown += f" _(+{len(ch_names) - 8} more)_"
+                parts.append(f"**{cat_name}:** {shown}")
+            parts.append("")
+
+        parts.append(
+            "**Fix:** edit each category above → Permissions → add "
+            "GateKeepr's role → grant Manage Roles. Channels inherit from "
+            "their category, so one overwrite there fixes all of them. "
+            "Then re-run `/lockdown`."
+        )
+
+        n_unman = len(unman) + (1 if verify_unman else 0)
+        embed.add_field(
+            name=f"🔧 Can't manage {n_unman} channel"
+                 f"{'' if n_unman == 1 else 's'} — won't be touched",
+            value="\n".join(parts)[:1024],
+            inline=False,
+        )
+
+    embed.add_field(
+        name="⚠️ Heads up",
+        value=(
+            "Members whose access depends only on server-level role permissions "
+            "(without explicit channel allow overwrites) will lose access to "
+            "locked channels. If your mod or staff roles already have explicit "
+            "channel overwrites, they'll keep them. Run `/lockdown-undo` to "
+            "reverse if anything looks wrong."
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"Click Confirm within {LOCKDOWN_CONFIRM_TIMEOUT_SECONDS}s to apply."
+    )
+    return embed
+
+
+async def _apply_lockdown(interaction: discord.Interaction, plan: dict):
+    """Walk the plan and apply overwrites with a partial-failure-safe order.
+
+    Crucial ordering rule for non-verify channels:
+        1. Set ALLOW overwrites for Verified + Patreon roles.
+        2. Only after those succeed, deny @everyone.
+    If step 1 fails (e.g. one of those roles sits above the bot's role and
+    can't be modified), we roll back the allows and abort. The channel is
+    left fully untouched — much better than half-locked, where @everyone
+    is denied but Verified hasn't been allowed yet (which is what made
+    everything invisible in older versions).
+
+    For the verify channel the order inverts: @everyone ALLOW is the only
+    critical step, so it goes first. The Verified/Patreon DENY overwrites
+    are cosmetic (they hide #verify from people who've already verified)
+    and are best-effort — failure there doesn't break verification.
+    """
+    guild = interaction.guild
+    verified_role = guild.get_role(plan["verified_role_id"])
+    patreon_roles = [
+        guild.get_role(rid) for rid in plan["patreon_role_ids"]
+    ]
+    patreon_roles = [r for r in patreon_roles if r is not None]
+    verify_channel = plan["verify_channel"]
+
+    success = 0
+    failed: list[str] = []
+    total = len(plan["to_lock"])
+    reason = f"Lockdown applied by {interaction.user}"
+
+    # ---- Verify channel: @everyone allow first, role denies are extras --
+    if verify_channel is not None:
+        ow_perms = verify_channel.permissions_for(guild.me)
+        if not (ow_perms.view_channel and ow_perms.manage_channels and ow_perms.manage_roles):
+            failed.append(
+                f"#{verify_channel.name} (bot can't manage permissions on "
+                f"this channel — check role overwrites)"
+            )
+        else:
+            try:
+                # Critical step: ensure unverified members can see #verify
+                await verify_channel.set_permissions(
+                    guild.default_role,
+                    view_channel=True,
+                    read_message_history=True,
+                    reason=reason,
+                )
+                touched_roles: list[int] = []
+                # Cosmetic: hide #verify from already-verified members.
+                # If these fail it doesn't break verification, so don't
+                # abort the whole channel.
+                if verified_role:
+                    try:
+                        await verify_channel.set_permissions(
+                            verified_role, view_channel=False, reason=reason
+                        )
+                        touched_roles.append(verified_role.id)
+                    except discord.HTTPException:
+                        pass
+                for prole in patreon_roles:
+                    try:
+                        await verify_channel.set_permissions(
+                            prole, view_channel=False, reason=reason
+                        )
+                        touched_roles.append(prole.id)
+                    except discord.HTTPException:
+                        pass
+                # Log it for /lockdown-undo
+                try:
+                    record_lockdown(
+                        guild.id, verify_channel.id,
+                        locked_by_user_id=interaction.user.id,
+                        modified_role_ids=touched_roles,
+                        is_verify_channel=True,
+                    )
+                except Exception as e:
+                    print(f"[lockdown] failed to record verify channel: {e}", flush=True)
+            except discord.Forbidden as e:
+                detail = (getattr(e, "text", None) or "Forbidden")[:50]
+                failed.append(f"#{verify_channel.name}: {detail}")
+            except discord.HTTPException as e:
+                failed.append(f"#{verify_channel.name} ({type(e).__name__})")
+
+    # ---- All other public channels: allows first, deny LAST ------------
+    for i, channel in enumerate(plan["to_lock"]):
+        ow_perms = channel.permissions_for(guild.me)
+        if not (ow_perms.view_channel and ow_perms.manage_channels and ow_perms.manage_roles):
+            failed.append(
+                f"#{channel.name} (bot can't manage permissions here)"
+            )
+            if i % 5 == 0 or i == total - 1:
+                try:
+                    progress = discord.Embed(
+                        title="🔒 Lockdown in progress…",
+                        description=f"Modified **{success}/{total}** channels.",
+                        color=discord.Color.orange(),
+                    )
+                    await interaction.edit_original_response(embed=progress, view=None)
+                except discord.HTTPException:
+                    pass
+            continue
+
+        is_voice = isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+        allow_kwargs = {"view_channel": True}
+        if is_voice:
+            allow_kwargs["connect"] = True
+            allow_kwargs["speak"] = True
+        else:
+            allow_kwargs["send_messages"] = True
+            allow_kwargs["read_message_history"] = True
+
+        async def _rollback(roles_to_clear):
+            """Best-effort: undo any allows we managed to apply on this
+            channel before the failure. Channel ends up fully untouched."""
+            for r in roles_to_clear:
+                try:
+                    await channel.set_permissions(r, overwrite=None)
+                except discord.HTTPException:
+                    pass
+
+        # Phase 1: allows (Verified + Patreon)
+        applied_roles: list[discord.Role] = []
+        phase1_failed_msg: str | None = None
+        try:
+            if verified_role:
+                await channel.set_permissions(
+                    verified_role, reason=reason, **allow_kwargs
+                )
+                applied_roles.append(verified_role)
+            for prole in patreon_roles:
+                await channel.set_permissions(
+                    prole, reason=reason, **allow_kwargs
+                )
+                applied_roles.append(prole)
+        except discord.Forbidden as e:
+            detail = (getattr(e, "text", None) or "Forbidden")[:50]
+            phase1_failed_msg = f"#{channel.name}: couldn't grant Verified/Patreon — {detail}"
+        except discord.HTTPException as e:
+            phase1_failed_msg = f"#{channel.name} ({type(e).__name__} during allow)"
+
+        if phase1_failed_msg is not None:
+            await _rollback(applied_roles)
+            failed.append(phase1_failed_msg)
+        else:
+            # Phase 2: deny @everyone — this is what actually locks it down
+            try:
+                await channel.set_permissions(
+                    guild.default_role, view_channel=False, reason=reason
+                )
+                try:
+                    record_lockdown(
+                        guild.id, channel.id,
+                        locked_by_user_id=interaction.user.id,
+                        modified_role_ids=[r.id for r in applied_roles],
+                        is_verify_channel=False,
+                    )
+                except Exception as e:
+                    print(f"[lockdown] failed to record {channel.id}: {e}", flush=True)
+                success += 1
+            except discord.Forbidden as e:
+                detail = (getattr(e, "text", None) or "Forbidden")[:50]
+                failed.append(f"#{channel.name}: couldn't deny @everyone — {detail}")
+                await _rollback(applied_roles)
+            except discord.HTTPException as e:
+                failed.append(f"#{channel.name} ({type(e).__name__} during deny)")
+                await _rollback(applied_roles)
+
+        if i % 5 == 0 or i == total - 1:
+            try:
+                progress = discord.Embed(
+                    title="🔒 Lockdown in progress…",
+                    description=f"Modified **{success}/{total}** channels.",
+                    color=discord.Color.orange(),
+                )
+                await interaction.edit_original_response(embed=progress, view=None)
+            except discord.HTTPException:
+                pass
+
+    # ---- Final report --------------------------------------------------
+    final = discord.Embed(
+        title="✅ Lockdown complete",
+        description=(
+            f"Modified **{success}** channel{'' if success == 1 else 's'}.\n"
+            f"{verify_channel.mention if verify_channel else '#verify'} is now "
+            f"the only channel unverified members can see."
+        ),
+        color=discord.Color.green(),
+    )
+    if failed:
+        names = "\n".join(f"• {f}" for f in failed[:15])
+        if len(failed) > 15:
+            names += f"\n…(+{len(failed) - 15} more)"
+        final.add_field(
+            name=f"⚠️ Couldn't modify {len(failed)} channel"
+                 f"{'' if len(failed) == 1 else 's'}",
+            value=names[:1024],
+            inline=False,
+        )
+        final.set_footer(
+            text="Specific reason shown next to each channel name above."
+        )
+    final.add_field(
+        name="Reverse",
+        value="Run `/lockdown-undo` to remove the @everyone deny we added.",
+        inline=False,
+    )
+
+    try:
+        await interaction.edit_original_response(embed=final, view=None)
+    except discord.HTTPException:
+        pass
+
+    await log_event(
+        guild,
+        f"🔒 **Lockdown applied** by {interaction.user.mention}: "
+        f"{success}/{total} channels locked, {len(failed)} failed.",
+        color=discord.Color.orange(),
+    )
+
+
+class LockdownConfirmView(discord.ui.View):
+    """Two-button confirmation. Locked to the user who invoked the command."""
+
+    def __init__(self, plan: dict, invoker_id: int):
+        super().__init__(timeout=LOCKDOWN_CONFIRM_TIMEOUT_SECONDS)
+        self.plan = plan
+        self.invoker_id = invoker_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the admin who ran the command can confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="Confirm lockdown", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable the buttons so they can't be re-clicked while we work
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        await _apply_lockdown(interaction, self.plan)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        cancelled = discord.Embed(
+            title="Cancelled",
+            description="No channels were modified.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.edit_message(embed=cancelled, view=self)
+
+
+@bot.tree.command(
+    name="lockdown",
+    description="Lock all public channels except #verify behind verification.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def lockdown_command(interaction: discord.Interaction):
+    settings = get_settings(interaction.guild.id)
+
+    verified_role_id = settings.get("verified_role_id")
+    verify_channel_id = settings.get("verify_channel_id")
+    if not verified_role_id or not verify_channel_id:
+        await interaction.response.send_message(
+            "❌ Set both `/set-verified-role` and `/set-verify-channel` "
+            "(or use the dashboard) before running lockdown.",
+            ephemeral=True,
+        )
+        return
+
+    verified_role = interaction.guild.get_role(verified_role_id)
+    verify_channel = interaction.guild.get_channel(verify_channel_id)
+    if not verified_role:
+        await interaction.response.send_message(
+            "❌ Configured verified role no longer exists. "
+            "Re-set it with `/set-verified-role`.",
+            ephemeral=True,
+        )
+        return
+    if not verify_channel:
+        await interaction.response.send_message(
+            "❌ Configured verify channel no longer exists. "
+            "Re-set it with `/set-verify-channel`.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.guild.me.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Lockdown requires the bot to have **Administrator** on this "
+            "server. Granular per-channel permissions get blocked by category "
+            "overwrites in too many setups, so this command is gated on admin "
+            "to keep behavior predictable.\n\n"
+            "**Fix:** Server Settings → Roles → GateKeepr → enable "
+            "**Administrator**. Re-run when ready. You can revoke admin "
+            "after the lockdown is in place if you prefer.",
+            ephemeral=True,
+        )
+        return
+
+    # Bot's top role must outrank the verified role to modify its overwrites.
+    # Administrator does NOT bypass role hierarchy — Discord still won't let
+    # us modify the overwrite of a role positioned above ours.
+    if interaction.guild.me.top_role <= verified_role:
+        await interaction.response.send_message(
+            "❌ My role needs to be **above** the verified role in your "
+            "server's role list. Move it up and try again.",
+            ephemeral=True,
+        )
+        return
+
+    plan = _compute_lockdown_plan(interaction.guild, settings)
+    if not plan["to_lock"] and not plan["verify_channel"]:
+        await interaction.response.send_message(
+            "Nothing to lock down — every channel is either already private "
+            "or matches the desired state.",
+            ephemeral=True,
+        )
+        return
+
+    embed = _build_lockdown_preview(interaction.guild, plan)
+    view = LockdownConfirmView(plan, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /lockdown-undo — strip the @everyone view-deny we added.
+# Only undoes channels that look like we locked them (i.e. @everyone has an
+# explicit view-deny). Other private channels (mod-only) are left alone.
+# ---------------------------------------------------------------------------
+
+class LockdownUndoConfirmView(discord.ui.View):
+    def __init__(self, records: list, ghost_ids: list[int], invoker_id: int):
+        super().__init__(timeout=LOCKDOWN_CONFIRM_TIMEOUT_SECONDS)
+        # records: list of {"channel": GuildChannel, "modified_role_ids": list[int],
+        #                   "is_verify_channel": bool}
+        self.records = records
+        self.ghost_ids = ghost_ids
+        self.invoker_id = invoker_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the admin who ran the command can confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="Confirm undo", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        guild = interaction.guild
+        success = 0
+        failed: list[str] = []
+        unlocked_ids: list[int] = []
+        reason = f"Lockdown undo by {interaction.user}"
+
+        for rec in self.records:
+            ch = rec["channel"]
+            ow_perms = ch.permissions_for(guild.me)
+            if not (ow_perms.view_channel and ow_perms.manage_channels and ow_perms.manage_roles):
+                failed.append(
+                    f"#{ch.name} (bot can't manage permissions here)"
+                )
+                continue
+
+            channel_failed = False
+            try:
+                # Remove the @everyone overwrite — restores inheritance
+                # (which is what the channel had before lockdown).
+                await ch.set_permissions(
+                    guild.default_role, overwrite=None, reason=reason
+                )
+            except discord.Forbidden as e:
+                detail = (getattr(e, "text", None) or "Forbidden")[:50]
+                failed.append(f"#{ch.name}: {detail}")
+                channel_failed = True
+            except discord.HTTPException as e:
+                failed.append(f"#{ch.name} ({type(e).__name__})")
+                channel_failed = True
+
+            # Remove the role overwrites we recorded too. Best-effort —
+            # if any of these fail it's noise, not a reason to mark the
+            # channel itself as failed (the @everyone removal is what
+            # actually un-locks it).
+            for role_id in rec["modified_role_ids"]:
+                role = guild.get_role(role_id)
+                if role is None:
+                    continue
+                try:
+                    await ch.set_permissions(role, overwrite=None, reason=reason)
+                except discord.HTTPException:
+                    pass
+
+            if not channel_failed:
+                success += 1
+                unlocked_ids.append(ch.id)
+
+        try:
+            clear_lockdown_history(guild.id, unlocked_ids + self.ghost_ids)
+        except Exception as e:
+            print(f"[lockdown-undo] failed to clear history: {e}", flush=True)
+
+        embed = discord.Embed(
+            title="✅ Lockdown undone",
+            description=(
+                f"Reopened **{success}** channel"
+                f"{'' if success == 1 else 's'} — removed every overwrite "
+                f"GateKeepr added (the @everyone deny plus any Verified/"
+                f"Patreon overwrites)."
+            ),
+            color=discord.Color.green(),
+        )
+        if self.ghost_ids:
+            embed.description += (
+                f"\nCleared {len(self.ghost_ids)} stale entr"
+                f"{'y' if len(self.ghost_ids) == 1 else 'ies'} for deleted channels."
+            )
+        if failed:
+            names = "\n".join(f"• {f}" for f in failed[:15])
+            if len(failed) > 15:
+                names += f"\n…(+{len(failed) - 15} more)"
+            embed.add_field(
+                name=f"⚠️ Couldn't reopen {len(failed)} channel"
+                     f"{'' if len(failed) == 1 else 's'}",
+                value=names[:1024],
+                inline=False,
+            )
+            embed.set_footer(
+                text="Failed channels stay in lockdown history — fix perms and re-run."
+            )
+        await interaction.edit_original_response(embed=embed, view=None)
+
+        await log_event(
+            guild,
+            f"🔓 **Lockdown undone** by {interaction.user.mention}: "
+            f"{success} channels reopened, {len(failed)} failed.",
+            color=discord.Color.blurple(),
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        cancelled = discord.Embed(
+            title="Cancelled",
+            description="No channels were modified.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.edit_message(embed=cancelled, view=self)
+
+
+@bot.tree.command(
+    name="lockdown-undo",
+    description="Reverse a lockdown: remove every overwrite GateKeepr added.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def lockdown_undo_command(interaction: discord.Interaction):
+    if not interaction.guild.me.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Undo requires the bot to have **Administrator** on this "
+            "server (same gate as `/lockdown`). Re-grant Administrator to "
+            "GateKeepr in Server Settings → Roles, run undo, then revoke "
+            "if you want.",
+            ephemeral=True,
+        )
+        return
+
+    # Source of truth: the lockdown_history table written by /lockdown.
+    # No more guessing-by-signature — the bot knows exactly which channels
+    # it modified AND which role overwrites it set on each one.
+    raw_records = get_lockdown_records(interaction.guild.id)
+
+    if not raw_records:
+        await interaction.response.send_message(
+            "Nothing to undo — GateKeepr hasn't locked any channels in this server.",
+            ephemeral=True,
+        )
+        return
+
+    # Resolve channel IDs to objects. Some may have been deleted since
+    # lockdown — those are 'ghosts' that we'll just clean from history
+    # without trying to modify them.
+    records: list[dict] = []
+    ghost_ids: list[int] = []
+    for r in raw_records:
+        ch = interaction.guild.get_channel(r["channel_id"])
+        if ch is None:
+            ghost_ids.append(r["channel_id"])
+        else:
+            records.append({
+                "channel": ch,
+                "modified_role_ids": r["modified_role_ids"],
+                "is_verify_channel": r["is_verify_channel"],
+            })
+
+    if not records:
+        clear_lockdown_history(interaction.guild.id, ghost_ids)
+        await interaction.response.send_message(
+            f"Nothing to undo — all {len(ghost_ids)} previously locked channel(s) "
+            f"have been deleted. Cleared the lockdown history.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🔓 Undo preview",
+        description=(
+            f"This will remove every overwrite GateKeepr added to **{len(records)}** "
+            f"channel{'' if len(records) == 1 else 's'} — the @everyone "
+            f"deny plus any Verified/Patreon overwrites we set on each one."
+        ),
+        color=discord.Color.blurple(),
+    )
+    sample = ", ".join(f"#{r['channel'].name}" for r in records[:15])
+    if len(records) > 15:
+        sample += f" _(+{len(records) - 15} more)_"
+    embed.add_field(name="Channels to reopen", value=sample[:1024], inline=False)
+
+    if ghost_ids:
+        embed.add_field(
+            name=f"🗑️ {len(ghost_ids)} deleted channel"
+                 f"{'' if len(ghost_ids) == 1 else 's'}",
+            value="These no longer exist; their history entries will be cleared.",
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"Click Confirm within {LOCKDOWN_CONFIRM_TIMEOUT_SECONDS}s to proceed."
+    )
+
+    view = LockdownUndoConfirmView(records, ghost_ids, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @bot.tree.command(name="reset-settings", description="Reset all verification settings to defaults.")
 @app_commands.default_permissions(administrator=True)
 async def reset_settings_command(interaction: discord.Interaction):
@@ -1525,7 +2725,11 @@ async def help_command(interaction: discord.Interaction):
             "verify channel.\n"
             "`/grandfather` — Grant the Verified role to every existing non-bot "
             "member. Run this once **before** locking down channel permissions "
-            "so your existing community isn't locked out."
+            "so your existing community isn't locked out.\n"
+            "`/lockdown` — Auto-lock all public channels behind the Verified role "
+            "(plus any Patreon roles). Shows a preview before applying.\n"
+            "`/lockdown-undo` — Reverse a lockdown by removing the @everyone "
+            "view-deny GateKeepr added."
         ),
         inline=False,
     )
@@ -1535,6 +2739,7 @@ async def help_command(interaction: discord.Interaction):
         name="View, Reset & Export",
         value=(
             "`/settings` — Show this server's current settings.\n"
+            "`/stats` — Show verification activity stats.\n"
             "`/reset-settings` — Wipe settings to defaults.\n"
             "`/clear-invite-data confirm:True` — Wipe tracking history. Keeps settings.\n"
             "`/export-data` — Download all bot data as JSON."
