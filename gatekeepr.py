@@ -1395,7 +1395,7 @@ async def status_writer():
         global_stats = compute_global_stats()
         payload = {
             "online": True,
-            "version": "1.5",  # bump this when you ship breaking changes
+            "version": "1.3",  # bump this when you ship breaking changes
             "uptime_seconds": int(time.time() - BOT_STARTED_AT),
             "last_updated": datetime.utcnow().isoformat() + "Z",
             **global_stats,
